@@ -75,11 +75,16 @@ LPCBYTE SigScan(
     return NULL;
 }
 
+// dwDisplacementOffset is the offset (from the start of the pattern) of the 4-byte
+// relative displacement operand. The instruction is assumed to end 4 bytes after that
+// (i.e. dwDisplacementOffset + sizeof(DWORD)), which is where RIP-relative addressing
+// is computed from.
 DWORD64 EvaluatePatternOffset(
     LPCSTR szTargetName,
     DWORD dwTextRVA,
     LPCBYTE lpPatternAddress,
-    LPCBYTE lpMemoryMappedFile
+    LPCBYTE lpMemoryMappedFile,
+    DWORD dwDisplacementOffset
 ) {
     printf(
         " ** Found %s pattern at offset: 0x%llX (0x%llX)\n",
@@ -88,13 +93,13 @@ DWORD64 EvaluatePatternOffset(
         (DWORD64) (lpPatternAddress - lpMemoryMappedFile) + dwTextRVA
     );
 
-    DWORD dwRelativeOffset = *(LPDWORD) (lpMemoryMappedFile + (lpPatternAddress - lpMemoryMappedFile) + 3);
+    LONG lRelativeOffset = *(PLONG) (lpMemoryMappedFile + (lpPatternAddress - lpMemoryMappedFile) + dwDisplacementOffset);
     printf(
         " ** %s relative offset: 0x%X\n",
         szTargetName,
-        dwRelativeOffset
+        lRelativeOffset
     );
-    DWORD64 qwGlobalObjectAddress = (DWORD64) (lpPatternAddress - lpMemoryMappedFile) + 7 + dwRelativeOffset;
+    DWORD64 qwGlobalObjectAddress = (DWORD64) ((LONG64) (lpPatternAddress - lpMemoryMappedFile) + dwDisplacementOffset + sizeof(DWORD) + lRelativeOffset);
     printf(
         "[+] %s global variable address offset: 0x%llX\n",
         szTargetName,
@@ -173,7 +178,15 @@ int main(int argc, const char *argv[]) {
     // 48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC ? 80 3D ? ? ? ? ? 48 8B F2 ? ? 48 8B F9 74 ? 4C 8D 05 ? ? ? ? EB
     BYTE abAppendStringPattern[] = { 0x48, 0x89, 0x5C, 0x24, '?', 0x48, 0x89, 0x74, 0x24, '?', 0x57, 0x48, 0x83, 0xEC, '?', 0x80, 0x3D, '?', '?', '?', '?', '?', 0x48, 0x8B, 0xF2, '?', '?', 0x48, 0x8B, 0xF9, 0x74, '?', 0x4C, 0x8D, 0x05, '?', '?', '?', '?', 0xEB };
     
-    DWORD64 qwGWorldOffset, qwGNamesOffset, qwGObjectsOffset;
+    BYTE abProcessEventXRefPattern[] = {
+        0x75, '?',
+        0x4C, 0x8B, 0xC5,
+        0x48, 0x8B, 0xD3,
+        0x48, 0x8B, 0xCF,
+        0xE8
+    };
+
+    DWORD64 qwGWorldOffset, qwGNamesOffset, qwGObjectsOffset, qwAppendStringOffset, qwProcessEventOffset;
     LPCBYTE lpGWorldPatternAddy = SigScan(
         lpMemoryMappedFile,
         nFileSize,
@@ -194,7 +207,8 @@ int main(int argc, const char *argv[]) {
         "GWorld",
         dwTextRVA,
         lpGWorldPatternAddy,
-        lpMemoryMappedFile
+        lpMemoryMappedFile,
+        3
     );
 
     LPCBYTE lpGNamesPatternAddy = SigScan(
@@ -216,7 +230,8 @@ int main(int argc, const char *argv[]) {
         "GNames",
         dwTextRVA,
         lpGNamesPatternAddy,
-        lpMemoryMappedFile
+        lpMemoryMappedFile,
+        3
     );
 
     LPCBYTE lpGObjectsPatternAddy = SigScan(
@@ -238,7 +253,8 @@ int main(int argc, const char *argv[]) {
         "GObjects",
         dwTextRVA,
         lpGObjectsPatternAddy,
-        lpMemoryMappedFile
+        lpMemoryMappedFile,
+        3
     );
 
     LPCBYTE lpAppendStringPatternAddy = SigScan(
@@ -256,18 +272,61 @@ int main(int argc, const char *argv[]) {
         goto _RYUJI;
     }
 
+    qwAppendStringOffset = (DWORD64) (lpAppendStringPatternAddy - lpMemoryMappedFile) + dwTextRVA;
+
     printf("[+] AppendString function offset: 0x%llX\n",
-        (DWORD64) (lpAppendStringPatternAddy - lpMemoryMappedFile) + dwTextRVA
+        qwAppendStringOffset
     );
+
+    LPCBYTE lpProcessEventXRefPatternAddy = SigScan(
+        lpMemoryMappedFile,
+        nFileSize,
+        abProcessEventXRefPattern,
+        sizeof(abProcessEventXRefPattern)
+    );
+
+    if (NULL == lpProcessEventXRefPatternAddy) {
+        fprintf(
+            stderr,
+            "[-] Failed to find ProcessEvent xref pattern in file.\n"
+        );
+        goto _RYUJI;
+    }
+
+    // Relative call offset is taken from the CALL instruction (last E8 byte), 
+    // The displacement operand starts right after the pattern ends
+    // (at sizeof(abProcessEventXRefPattern)), so EvaluatePatternOffset can compute the absolute
+    // address of the ProcessEvent function the same way it does for GWorld/GNames/GObjects.
+    /*
+        .text:000000014386DFD2 75 0E                                                        jnz     short loc_14386DFE2
+        .text:000000014386DFD4 4C 8B C5                                                     mov     r8, rbp
+        .text:000000014386DFD7 48 8B D3                                                     mov     rdx, rbx
+        .text:000000014386DFDA 48 8B CF                                                     mov     rcx, rdi
+        .text:000000014386DFDD E8 BE 73 D3 FD                                               call    sub_1415A53A0
+    */
+
+    qwProcessEventOffset = EvaluatePatternOffset(
+        "ProcessEvent",
+        dwTextRVA,
+        lpProcessEventXRefPatternAddy,
+        lpMemoryMappedFile,
+        (DWORD) sizeof(abProcessEventXRefPattern)
+    );
+
+    // gobject, appendstring, gnames, gworld, processevent
 
     printf(
         "\n"
-        " :: GWorld   : 0x%llX\n"
-        " :: GNames   : 0x%llX\n"
-        " :: GObjects : 0x%llX\n\n",
-        qwGWorldOffset,
+        " :: GObjects       : 0x%08llX\n"
+        " :: AppendString   : 0x%08llX\n"
+        " :: GNames         : 0x%08llX\n"
+        " :: GWorld         : 0x%08llX\n"
+        " :: ProcessEvent   : 0x%08llX\n\n",
+        qwGObjectsOffset,
+        qwAppendStringOffset,
         qwGNamesOffset,
-        qwGObjectsOffset
+        qwGWorldOffset,
+        qwProcessEventOffset
     );
     system("pause");
 
