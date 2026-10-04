@@ -17,6 +17,153 @@
 #include <Windows.h>
 #include <stdio.h>
 
+typedef DWORD64 QWORD, QWORD64, *PQWORD, *PQWORD64;
+
+typedef struct _DUMPER_OPTIONS {
+    LPCSTR InputPath;
+    LPCSTR JsonOutputPath;
+    BOOL PauseOnExit;
+} DUMPER_OPTIONS, *PDUMPER_OPTIONS;
+
+typedef struct _DUMPED_OFFSETS {
+    QWORD GObjects;
+    QWORD AppendString;
+    QWORD GNames;
+    QWORD GWorld;
+    QWORD ProcessEvent;
+} DUMPED_OFFSETS, *PDUMPED_OFFSETS;
+
+VOID PrintUsage(
+    LPCSTR cszExecutableName
+) {
+    printf(
+        "Usage:\n"
+        "  %s <path_to_grounded2exe>\n"
+        "  %s <path_to_grounded2exe> --json <output_file>\n"
+        "  %s <path_to_grounded2exe> --no-pause\n"
+        "\n"
+        "Options:\n"
+        "  --json <path>   Write discovered offsets to a JSON file.\n"
+        "                  This also disables the final pause.\n"
+        "  --no-pause     Do not pause before exiting.\n",
+        cszExecutableName,
+        cszExecutableName,
+        cszExecutableName
+    );
+}
+
+BOOL ParseArguments(
+    INT argc,
+    LPCSTR CONST argv[],
+    PDUMPER_OPTIONS lpOptions
+) {
+    if (NULL == lpOptions || argc < 2) {
+        return FALSE;
+    }
+
+    lpOptions->InputPath = argv[1];
+    lpOptions->JsonOutputPath = NULL;
+    lpOptions->PauseOnExit = TRUE;
+
+    for (INT i = 2; i < argc; ++i) {
+        if (0 == strcmp(argv[i], "--json")) {
+            if ((i + 1) >= argc) {
+                fprintf(
+                    stderr,
+                    "[-] Missing output path after --json.\n"
+                );
+                return FALSE;
+            }
+
+            lpOptions->JsonOutputPath = argv[++i];
+
+            // JSON mode is intended for CI/non-interactive use.
+            lpOptions->PauseOnExit = FALSE;
+        } else if (0 == strcmp(argv[i], "--no-pause")) {
+            lpOptions->PauseOnExit = FALSE;
+        } else {
+            fprintf(
+                stderr,
+                "[-] Unknown argument: %s\n",
+                argv[i]
+            );
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+BOOL WriteOffsetsJson(
+    LPCSTR szOutputPath,
+    CONST DUMPED_OFFSETS* lpOffsets
+) {
+    if (NULL == szOutputPath || NULL == lpOffsets) {
+        return FALSE;
+    }
+
+    FILE* fpOutput = NULL;
+
+    errno_t iOpenResult = fopen_s(
+        &fpOutput,
+        szOutputPath,
+        "wb"
+    );
+
+    if (0 != iOpenResult || NULL == fpOutput) {
+        fprintf(
+            stderr,
+            "[-] Failed to open JSON output file: %s\n",
+            szOutputPath
+        );
+        return FALSE;
+    }
+
+    INT iWriteResult = fprintf(
+        fpOutput,
+        "{\n"
+        "  \"GObjects\": \"0x%08llX\",\n"
+        "  \"AppendString\": \"0x%08llX\",\n"
+        "  \"GNames\": \"0x%08llX\",\n"
+        "  \"GWorld\": \"0x%08llX\",\n"
+        "  \"ProcessEvent\": \"0x%08llX\"\n"
+        "}\n",
+        lpOffsets->GObjects,
+        lpOffsets->AppendString,
+        lpOffsets->GNames,
+        lpOffsets->GWorld,
+        lpOffsets->ProcessEvent
+    );
+
+    if (iWriteResult < 0) {
+        fprintf(
+            stderr,
+            "[-] Failed to write JSON output file: %s\n",
+            szOutputPath
+        );
+
+        fclose(fpOutput);
+        return FALSE;
+    }
+
+    if (0 != fclose(fpOutput)) {
+        fprintf(
+            stderr,
+            "[-] Failed to finalize JSON output file: %s\n",
+            szOutputPath
+        );
+        return FALSE;
+    }
+
+    printf(
+        "[+] Wrote offsets to: %s\n",
+        szOutputPath
+    );
+
+    return TRUE;
+}
+
+
 DWORD GetTextRVA(
     LPCBYTE lpMemoryMappedFile
 ) {
@@ -110,30 +257,78 @@ DWORD64 EvaluatePatternOffset(
 }
 
 int main(int argc, const char *argv[]) {
-    if (argc < 2) {
-        printf("Usage: G2Dumper <path_to_grounded2exe>\n");
+    if (
+        argc < 2 || 
+        0 == strcmp(argv[1], "--help") || 
+        0 == strcmp(argv[1], "-h")
+    ) {
+        PrintUsage(argv[0]);
+
+        return argc < 2
+            ? EXIT_FAILURE
+            : EXIT_SUCCESS;
+    }
+
+    DUMPER_OPTIONS Options = { 0 };
+
+    if (!ParseArguments(argc, argv, &Options)) {
+        PrintUsage(argv[0]);
         return EXIT_FAILURE;
     }
+
+    INT iExitCode = EXIT_FAILURE;
 
     LPCBYTE lpMemoryMappedFile = NULL;
     FILE *fpExe = NULL;
 
-    if (EXIT_SUCCESS != fopen_s(
-        &fpExe,
-        argv[1],
-        "rb"
-    )) {
+    DUMPED_OFFSETS Offsets = { 0 };
+
+    if (
+        EXIT_SUCCESS != fopen_s(
+            &fpExe,
+            Options.InputPath,
+            "rb"
+        )
+        ) {
         fprintf(
             stderr,
             "[-] Failed to open file: %s\n",
-            argv[1]
+            Options.InputPath
         );
         return EXIT_FAILURE;
     }
 
-    fseek(fpExe, 0, SEEK_END);
-    SIZE_T nFileSize = ftell(fpExe);
-    fseek(fpExe, 0, SEEK_SET);
+    if (0 != fseek(
+        fpExe,
+        0,
+        SEEK_END
+    )) {
+        fprintf(
+            stderr,
+            "[-] Failed to seek to end of input file.\n"
+        );
+        goto _RYUJI;
+    }
+
+    LONG lFileSize = ftell(fpExe);
+
+    if (lFileSize <= 0) {
+        fprintf(
+            stderr,
+            "[-] Failed to determine input file size.\n"
+        );
+        goto _RYUJI;
+    }
+
+    SIZE_T nFileSize = (SIZE_T) lFileSize;
+
+    if (0 != fseek(fpExe, 0, SEEK_SET)) {
+        fprintf(
+            stderr,
+            "[-] Failed to seek to start of input file.\n"
+        );
+        goto _RYUJI;
+    }
 
     lpMemoryMappedFile = VirtualAlloc(
         NULL,
@@ -148,8 +343,7 @@ int main(int argc, const char *argv[]) {
             "[-] Failed to allocate memory for file mapping: E%lu\n",
             GetLastError()
         );
-        fclose(fpExe);
-        return EXIT_FAILURE;
+        goto _RYUJI;
     }
 
     SIZE_T nBytesRead = fread(
@@ -169,15 +363,79 @@ int main(int argc, const char *argv[]) {
         goto _RYUJI;
     }
 
-    //48 89 1D ? ? ? ? 48 8D 05 ? ? ? ? 48 83 C4
-    BYTE abGWorldPattern[] = { 0x48, 0x89, 0x1D, '?', '?', '?', '?', 0x48, 0x8D, 0x05, '?', '?', '?', '?', 0x48, 0x83, 0xC4 };
+    DWORD dwTextRVA =
+        GetTextRVA(lpMemoryMappedFile);
+
+    if (0 == dwTextRVA) {
+        goto _RYUJI;
+    }
+
+    //
+    // GWorld
+    //
+    // 48 89 1D ? ? ? ? 48 8D 05 ? ? ? ? 48 83 C4
+    //
+    BYTE abGWorldPattern[] = {
+        0x48, 0x89, 0x1D,
+        '?', '?', '?', '?',
+        0x48, 0x8D, 0x05,
+        '?', '?', '?', '?',
+        0x48, 0x83, 0xC4
+    };
+
+    //
+    // GNames
+    //
     // 48 8D 0D ? ? ? ? 4C 89 7D ? 4C 89 7D ? E8
-    BYTE abGNamesPattern[] = { 0x48, 0x8D, 0x0D, '?', '?', '?', '?', 0x4C, 0x89, 0x7D, '?', 0x4C, 0x89, 0x7D, '?', 0xE8 };
+    //
+    BYTE abGNamesPattern[] = {
+        0x48, 0x8D, 0x0D,
+        '?', '?', '?', '?',
+        0x4C, 0x89, 0x7D, '?',
+        0x4C, 0x89, 0x7D, '?',
+        0xE8
+    };
+
+    //
+    // GObjects
+    //
     // 48 89 15 ? ? ? ? 85 C0 7E ? 4C 8B C3 44 8B CB
-    BYTE abGObjectsPattern[] = { 0x48, 0x89, 0x15, '?', '?', '?', '?', 0x85, 0xC0, 0x7E, '?', 0x4C, 0x8B, 0xC3, 0x44, 0x8B, 0xCB };
-    // 48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC ? 80 3D ? ? ? ? ? 48 8B F2 ? ? 48 8B F9 74 ? 4C 8D 05 ? ? ? ? EB
-    BYTE abAppendStringPattern[] = { 0x48, 0x89, 0x5C, 0x24, '?', 0x48, 0x89, 0x74, 0x24, '?', 0x57, 0x48, 0x83, 0xEC, '?', 0x80, 0x3D, '?', '?', '?', '?', '?', 0x48, 0x8B, 0xF2, '?', '?', 0x48, 0x8B, 0xF9, 0x74, '?', 0x4C, 0x8D, 0x05, '?', '?', '?', '?', 0xEB };
-    
+    //
+    BYTE abGObjectsPattern[] = {
+        0x48, 0x89, 0x15,
+        '?', '?', '?', '?',
+        0x85, 0xC0, 0x7E, '?',
+        0x4C, 0x8B, 0xC3,
+        0x44, 0x8B, 0xCB
+    };
+
+    //
+    // AppendString
+    //
+    // 48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC ?
+    // 80 3D ? ? ? ? ? 48 8B F2 ? ? 48 8B F9 74 ?
+    // 4C 8D 05 ? ? ? ? EB
+    //
+    BYTE abAppendStringPattern[] = {
+        0x48, 0x89, 0x5C, 0x24, '?',
+        0x48, 0x89, 0x74, 0x24, '?',
+        0x57,
+        0x48, 0x83, 0xEC, '?',
+        0x80, 0x3D,
+        '?', '?', '?', '?',
+        '?',
+        0x48, 0x8B, 0xF2,
+        '?', '?',
+        0x48, 0x8B, 0xF9,
+        0x74, '?',
+        0x4C, 0x8D, 0x05,
+        '?', '?', '?', '?',
+        0xEB
+    };
+
+    //
+    // ProcessEvent xref
+    //
     BYTE abProcessEventXRefPattern[] = {
         0x75, '?',
         0x4C, 0x8B, 0xC5,
@@ -186,13 +444,13 @@ int main(int argc, const char *argv[]) {
         0xE8
     };
 
-    DWORD64 qwGWorldOffset, qwGNamesOffset, qwGObjectsOffset, qwAppendStringOffset, qwProcessEventOffset;
-    LPCBYTE lpGWorldPatternAddy = SigScan(
-        lpMemoryMappedFile,
-        nFileSize,
-        abGWorldPattern,
-        sizeof(abGWorldPattern)
-    );
+    LPCBYTE lpGWorldPatternAddy =
+        SigScan(
+            lpMemoryMappedFile,
+            nFileSize,
+            abGWorldPattern,
+            sizeof(abGWorldPattern)
+        );
 
     if (NULL == lpGWorldPatternAddy) {
         fprintf(
@@ -202,21 +460,22 @@ int main(int argc, const char *argv[]) {
         goto _RYUJI;
     }
 
-    DWORD dwTextRVA = GetTextRVA(lpMemoryMappedFile);
-    qwGWorldOffset = EvaluatePatternOffset(
-        "GWorld",
-        dwTextRVA,
-        lpGWorldPatternAddy,
-        lpMemoryMappedFile,
-        3
-    );
+    Offsets.GWorld =
+        EvaluatePatternOffset(
+            "GWorld",
+            dwTextRVA,
+            lpGWorldPatternAddy,
+            lpMemoryMappedFile,
+            3
+        );
 
-    LPCBYTE lpGNamesPatternAddy = SigScan(
-        lpMemoryMappedFile,
-        nFileSize,
-        abGNamesPattern,
-        sizeof(abGNamesPattern)
-    );
+    LPCBYTE lpGNamesPatternAddy =
+        SigScan(
+            lpMemoryMappedFile,
+            nFileSize,
+            abGNamesPattern,
+            sizeof(abGNamesPattern)
+        );
 
     if (NULL == lpGNamesPatternAddy) {
         fprintf(
@@ -226,20 +485,22 @@ int main(int argc, const char *argv[]) {
         goto _RYUJI;
     }
 
-    qwGNamesOffset = EvaluatePatternOffset(
-        "GNames",
-        dwTextRVA,
-        lpGNamesPatternAddy,
-        lpMemoryMappedFile,
-        3
-    );
+    Offsets.GNames =
+        EvaluatePatternOffset(
+            "GNames",
+            dwTextRVA,
+            lpGNamesPatternAddy,
+            lpMemoryMappedFile,
+            3
+        );
 
-    LPCBYTE lpGObjectsPatternAddy = SigScan(
-        lpMemoryMappedFile,
-        nFileSize,
-        abGObjectsPattern,
-        sizeof(abGObjectsPattern)
-    );
+    LPCBYTE lpGObjectsPatternAddy =
+        SigScan(
+            lpMemoryMappedFile,
+            nFileSize,
+            abGObjectsPattern,
+            sizeof(abGObjectsPattern)
+        );
 
     if (NULL == lpGObjectsPatternAddy) {
         fprintf(
@@ -249,20 +510,22 @@ int main(int argc, const char *argv[]) {
         goto _RYUJI;
     }
 
-    qwGObjectsOffset = EvaluatePatternOffset(
-        "GObjects",
-        dwTextRVA,
-        lpGObjectsPatternAddy,
-        lpMemoryMappedFile,
-        3
-    );
+    Offsets.GObjects =
+        EvaluatePatternOffset(
+            "GObjects",
+            dwTextRVA,
+            lpGObjectsPatternAddy,
+            lpMemoryMappedFile,
+            3
+        );
 
-    LPCBYTE lpAppendStringPatternAddy = SigScan(
-        lpMemoryMappedFile,
-        nFileSize,
-        abAppendStringPattern,
-        sizeof(abAppendStringPattern)
-    );
+    LPCBYTE lpAppendStringPatternAddy =
+        SigScan(
+            lpMemoryMappedFile,
+            nFileSize,
+            abAppendStringPattern,
+            sizeof(abAppendStringPattern)
+        );
 
     if (NULL == lpAppendStringPatternAddy) {
         fprintf(
@@ -272,18 +535,25 @@ int main(int argc, const char *argv[]) {
         goto _RYUJI;
     }
 
-    qwAppendStringOffset = (DWORD64) (lpAppendStringPatternAddy - lpMemoryMappedFile) + dwTextRVA;
+    Offsets.AppendString =
+        (DWORD64) (
+            lpAppendStringPatternAddy -
+            lpMemoryMappedFile
+            ) +
+        dwTextRVA;
 
-    printf("[+] AppendString function offset: 0x%llX\n",
-        qwAppendStringOffset
+    printf(
+        "[+] AppendString function offset: 0x%llX\n",
+        Offsets.AppendString
     );
 
-    LPCBYTE lpProcessEventXRefPatternAddy = SigScan(
-        lpMemoryMappedFile,
-        nFileSize,
-        abProcessEventXRefPattern,
-        sizeof(abProcessEventXRefPattern)
-    );
+    LPCBYTE lpProcessEventXRefPatternAddy =
+        SigScan(
+            lpMemoryMappedFile,
+            nFileSize,
+            abProcessEventXRefPattern,
+            sizeof(abProcessEventXRefPattern)
+        );
 
     if (NULL == lpProcessEventXRefPatternAddy) {
         fprintf(
@@ -304,16 +574,14 @@ int main(int argc, const char *argv[]) {
         .text:000000014386DFDA 48 8B CF                                                     mov     rcx, rdi
         .text:000000014386DFDD E8 BE 73 D3 FD                                               call    sub_1415A53A0
     */
-
-    qwProcessEventOffset = EvaluatePatternOffset(
-        "ProcessEvent",
-        dwTextRVA,
-        lpProcessEventXRefPatternAddy,
-        lpMemoryMappedFile,
-        (DWORD) sizeof(abProcessEventXRefPattern)
-    );
-
-    // gobject, appendstring, gnames, gworld, processevent
+    Offsets.ProcessEvent =
+        EvaluatePatternOffset(
+            "ProcessEvent",
+            dwTextRVA,
+            lpProcessEventXRefPatternAddy,
+            lpMemoryMappedFile,
+            (DWORD) sizeof(abProcessEventXRefPattern)
+        );
 
     printf(
         "\n"
@@ -321,22 +589,43 @@ int main(int argc, const char *argv[]) {
         " :: AppendString   : 0x%08llX\n"
         " :: GNames         : 0x%08llX\n"
         " :: GWorld         : 0x%08llX\n"
-        " :: ProcessEvent   : 0x%08llX\n\n",
-        qwGObjectsOffset,
-        qwAppendStringOffset,
-        qwGNamesOffset,
-        qwGWorldOffset,
-        qwProcessEventOffset
+        " :: ProcessEvent   : 0x%08llX\n"
+        "\n",
+        Offsets.GObjects,
+        Offsets.AppendString,
+        Offsets.GNames,
+        Offsets.GWorld,
+        Offsets.ProcessEvent
     );
-    system("pause");
+
+    if (
+        NULL != Options.JsonOutputPath &&
+        !WriteOffsetsJson(
+            Options.JsonOutputPath,
+            &Offsets
+        )
+        ) {
+        goto _RYUJI;
+    }
+
+    iExitCode = EXIT_SUCCESS;
+
+    if (Options.PauseOnExit) {
+        system("pause");
+    }
 
 _RYUJI:
-    VirtualFree(
-        (LPVOID) lpMemoryMappedFile,
-        0,
-        MEM_RELEASE
-    );
+    if (NULL != lpMemoryMappedFile) {
+        VirtualFree(
+            (LPVOID) lpMemoryMappedFile,
+            0,
+            MEM_RELEASE
+        );
+    }
 
-    fclose(fpExe);
-    return EXIT_SUCCESS;
+    if (NULL != fpExe) {
+        fclose(fpExe);
+    }
+
+    return iExitCode;
 }
