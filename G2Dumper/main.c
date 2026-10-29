@@ -17,6 +17,8 @@
 #include <Windows.h>
 #include <stdio.h>
 
+#include "H2SS/SigScan64.h"
+
 typedef DWORD64 QWORD, QWORD64, *PQWORD, *PQWORD64;
 
 typedef struct _DUMPER_OPTIONS {
@@ -31,6 +33,7 @@ typedef struct _DUMPED_OFFSETS {
     QWORD GNames;
     QWORD GWorld;
     QWORD ProcessEvent;
+    QWORD FindFunctionChecked;
 } DUMPED_OFFSETS, *PDUMPED_OFFSETS;
 
 VOID PrintUsage(
@@ -126,13 +129,15 @@ BOOL WriteOffsetsJson(
         "  \"AppendString\": \"0x%08llX\",\n"
         "  \"GNames\": \"0x%08llX\",\n"
         "  \"GWorld\": \"0x%08llX\",\n"
-        "  \"ProcessEvent\": \"0x%08llX\"\n"
+        "  \"ProcessEvent\": \"0x%08llX\",\n"
+        "  \"FindFunctionChecked\": \"0x%08llX\"\n"
         "}\n",
         lpOffsets->GObjects,
         lpOffsets->AppendString,
         lpOffsets->GNames,
         lpOffsets->GWorld,
-        lpOffsets->ProcessEvent
+        lpOffsets->ProcessEvent,
+        lpOffsets->FindFunctionChecked
     );
 
     if (iWriteResult < 0) {
@@ -191,35 +196,13 @@ DWORD GetTextRVA(
         (PIMAGE_SECTION_HEADER) (lpMemoryMappedFile + pDosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS));
     for (WORD i = 0; i < pNtHeaders->FileHeader.NumberOfSections; i++) {
         if (0 == strcmp(
-            (LPCSTR) pSectionHeaders[i].Name, 
+            (LPCSTR) pSectionHeaders[i].Name,
             ".text"
         )) {
             return pSectionHeaders[i].VirtualAddress - pSectionHeaders[i].PointerToRawData;
         }
     }
     return 0;
-}
-
-LPCBYTE SigScan(
-    LPCBYTE lpBase,
-    SIZE_T nSearchSize,
-    LPCBYTE lpPattern,
-    SIZE_T nPatternSize
-) {
-    // pattern looks like "8F ? 45 23 ?" or so..
-    for (SIZE_T i = 0; i <= nSearchSize - nPatternSize; i++) {
-        BOOL bFound = TRUE;
-        for (SIZE_T j = 0; j < nPatternSize; j++) {
-            if (lpPattern[j] != '?' && lpBase[i + j] != lpPattern[j]) {
-                bFound = FALSE;
-                break;
-            }
-        }
-        if (bFound) {
-            return lpBase + i;
-        }
-    }
-    return NULL;
 }
 
 // dwDisplacementOffset is the offset (from the start of the pattern) of the 4-byte
@@ -258,20 +241,28 @@ DWORD64 EvaluatePatternOffset(
 
 int main(int argc, const char *argv[]) {
     if (
-        argc < 2 || 
-        0 == strcmp(argv[1], "--help") || 
+        argc < 2 ||
+        0 == strcmp(argv[1], "--help") ||
         0 == strcmp(argv[1], "-h")
     ) {
         PrintUsage(argv[0]);
 
-        return argc < 2
-            ? EXIT_FAILURE
-            : EXIT_SUCCESS;
+        return argc < 2 ? EXIT_FAILURE : EXIT_SUCCESS;
     }
 
     DUMPER_OPTIONS Options = { 0 };
 
     if (!ParseArguments(argc, argv, &Options)) {
+        PrintUsage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    // shut the fopen warning up
+    if (NULL == Options.InputPath) {
+        fprintf(
+            stderr,
+            "[-] Input path is required.\n"
+        );
         PrintUsage(argv[0]);
         return EXIT_FAILURE;
     }
@@ -283,13 +274,7 @@ int main(int argc, const char *argv[]) {
 
     DUMPED_OFFSETS Offsets = { 0 };
 
-    if (
-        EXIT_SUCCESS != fopen_s(
-            &fpExe,
-            Options.InputPath,
-            "rb"
-        )
-        ) {
+    if (EXIT_SUCCESS != fopen_s(&fpExe, Options.InputPath, "rb")) {
         fprintf(
             stderr,
             "[-] Failed to open file: %s\n",
@@ -370,43 +355,26 @@ int main(int argc, const char *argv[]) {
         goto _RYUJI;
     }
 
-    //
-    // GWorld
-    //
-    // 48 89 1D ? ? ? ? 48 8D 05 ? ? ? ? 48 83 C4
-    //
-    BYTE abGWorldPattern[] = {
-        0x48, 0x89, 0x1D,
-        '?', '?', '?', '?',
-        0x48, 0x8D, 0x05,
-        '?', '?', '?', '?',
-        0x48, 0x83, 0xC4
+    UMASK mGWorldPattern[] = {
+        0x48, 0x8B, '??', '??',
+        0x48, 0x89, '??', '??', '??', '??', '0?',
+        0x4C, 0x8B, '7?', '7?'
     };
 
-    //
-    // GNames
-    //
-    // 48 8D 0D ? ? ? ? 4C 89 7D ? 4C 89 7D ? E8
-    //
-    BYTE abGNamesPattern[] = {
-        0x48, 0x8D, 0x0D,
-        '?', '?', '?', '?',
-        0x4C, 0x89, 0x7D, '?',
-        0x4C, 0x89, 0x7D, '?',
-        0xE8
+    // unused cuz AppendString loads gnames at +0x20 (https://github.com/x0reaxeax/Grounded2Minimal/issues/49#issuecomment-6499518533)
+    // this pattern is therefore within AppendString
+    UMASK mGNamesPattern[] = {
+        0x48, 0x8B, 0xF2, 0x8B, 0x19, 0x48, 0x8B, 0xF9,
+        0x74, '??', 0x4C, 0x8D, 0x05, '??', '??', '??',
+        '??', 0xEB, '??', 0x48, 0x8D, 0x0D, '??', '??',
+        '??', '??', 0xE8, '??', '??', '??', '??', 0x4C,
+        0x8B, 0xC0
     };
 
-    //
-    // GObjects
-    //
-    // 48 89 15 ? ? ? ? 85 C0 7E ? 4C 8B C3 44 8B CB
-    //
-    BYTE abGObjectsPattern[] = {
-        0x48, 0x89, 0x15,
-        '?', '?', '?', '?',
-        0x85, 0xC0, 0x7E, '?',
-        0x4C, 0x8B, 0xC3,
-        0x44, 0x8B, 0xCB
+    UMASK mGObjectsPattern[] = {
+        0x44, 0x8B, 0xC7, 0x48, 0x8D, 0x0D, '??', '??',
+        '??', '??', 0x8B, 0xD6, 0xE8, '??', '??', '??',
+        '??', 0xE9
     };
 
     //
@@ -416,41 +384,44 @@ int main(int argc, const char *argv[]) {
     // 80 3D ? ? ? ? ? 48 8B F2 ? ? 48 8B F9 74 ?
     // 4C 8D 05 ? ? ? ? EB
     //
-    BYTE abAppendStringPattern[] = {
-        0x48, 0x89, 0x5C, 0x24, '?',
-        0x48, 0x89, 0x74, 0x24, '?',
+    UMASK mAppendStringPattern[] = {
+        0x48, 0x89, 0x5C, 0x24, '??',
+        0x48, 0x89, 0x74, 0x24, '??',
         0x57,
-        0x48, 0x83, 0xEC, '?',
-        0x80, 0x3D,
-        '?', '?', '?', '?',
-        '?',
+        0x48, 0x83, 0xEC, '??',
+        0x80, 0x3D, '??', '??', '??', '??', '??',
         0x48, 0x8B, 0xF2,
-        '?', '?',
+        '??', '??',
         0x48, 0x8B, 0xF9,
-        0x74, '?',
-        0x4C, 0x8D, 0x05,
-        '?', '?', '?', '?',
+        0x74, '??',
+        0x4C, 0x8D, 0x05, '??', '??', '??', '??',       // lea     r8, stru_???????? <GNames>
         0xEB
     };
 
-    //
-    // ProcessEvent xref
-    //
-    BYTE abProcessEventXRefPattern[] = {
-        0x75, '?',
-        0x4C, 0x8B, 0xC5,
-        0x48, 0x8B, 0xD3,
-        0x48, 0x8B, 0xCF,
-        0xE8
+    UMASK mProcessEventPattern[] = {
+        0x40, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55,
+        0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC, '??',
+        '??', '??', '??', 0x48, 0x8D, 0x6C, 0x24, '??',
+        0x48, 0x89, 0x9D, '??', '??', '??', '??', 0x48,
+        0x8B, 0x05, '??', '??', '??', '??', 0x48, 0x33,
+        0xC5, 0x48, 0x89, 0x85, '??', '??', '??', '??',
+        0x8B, 0x41, 0x08
     };
 
-    LPCBYTE lpGWorldPatternAddy =
-        SigScan(
-            lpMemoryMappedFile,
-            nFileSize,
-            abGWorldPattern,
-            sizeof(abGWorldPattern)
-        );
+    UMASK mFindFunctionCheckedPattern[] = {
+        0x48, 0x89, 0x5C, 0x24, '??', 0x48, 0x89, 0x54,
+        0x24, '??', 0x57, 0x48, 0x83, 0xEC, '??', 0x48,
+        0x8B, 0xF9, 0x41, 0xB8, 0x01, 0x00, 0x00, 0x00,
+        0x48, 0x8B, 0x49, 0x10, 0xE8, '??', '??', '??',
+        '??', 0x48, 0x8B, 0xD8, 0x48, 0x85, 0xC0
+    };
+
+    LPCBYTE lpGWorldPatternAddy = SearchForMaskedSignature(
+        lpMemoryMappedFile,
+        nFileSize,
+        mGWorldPattern,
+        MASK_SIZE(mGWorldPattern)
+    );
 
     if (NULL == lpGWorldPatternAddy) {
         fprintf(
@@ -460,47 +431,20 @@ int main(int argc, const char *argv[]) {
         goto _RYUJI;
     }
 
-    Offsets.GWorld =
-        EvaluatePatternOffset(
-            "GWorld",
-            dwTextRVA,
-            lpGWorldPatternAddy,
-            lpMemoryMappedFile,
-            3
-        );
+    Offsets.GWorld = EvaluatePatternOffset(
+        "GWorld",
+        dwTextRVA,
+        lpGWorldPatternAddy,
+        lpMemoryMappedFile,
+        7
+    );
 
-    LPCBYTE lpGNamesPatternAddy =
-        SigScan(
-            lpMemoryMappedFile,
-            nFileSize,
-            abGNamesPattern,
-            sizeof(abGNamesPattern)
-        );
-
-    if (NULL == lpGNamesPatternAddy) {
-        fprintf(
-            stderr,
-            "[-] Failed to find GNames pattern in file.\n"
-        );
-        goto _RYUJI;
-    }
-
-    Offsets.GNames =
-        EvaluatePatternOffset(
-            "GNames",
-            dwTextRVA,
-            lpGNamesPatternAddy,
-            lpMemoryMappedFile,
-            3
-        );
-
-    LPCBYTE lpGObjectsPatternAddy =
-        SigScan(
-            lpMemoryMappedFile,
-            nFileSize,
-            abGObjectsPattern,
-            sizeof(abGObjectsPattern)
-        );
+    LPCBYTE lpGObjectsPatternAddy = SearchForMaskedSignature(
+        lpMemoryMappedFile,
+        nFileSize,
+        mGObjectsPattern,
+        MASK_SIZE(mGObjectsPattern)
+    );
 
     if (NULL == lpGObjectsPatternAddy) {
         fprintf(
@@ -510,22 +454,20 @@ int main(int argc, const char *argv[]) {
         goto _RYUJI;
     }
 
-    Offsets.GObjects =
-        EvaluatePatternOffset(
-            "GObjects",
-            dwTextRVA,
-            lpGObjectsPatternAddy,
-            lpMemoryMappedFile,
-            3
-        );
+    Offsets.GObjects = EvaluatePatternOffset(
+        "GObjects",
+        dwTextRVA,
+        lpGObjectsPatternAddy,
+        lpMemoryMappedFile,
+        6
+    );
 
-    LPCBYTE lpAppendStringPatternAddy =
-        SigScan(
-            lpMemoryMappedFile,
-            nFileSize,
-            abAppendStringPattern,
-            sizeof(abAppendStringPattern)
-        );
+    LPCBYTE lpAppendStringPatternAddy = SearchForMaskedSignature(
+        lpMemoryMappedFile,
+        nFileSize,
+        mAppendStringPattern,
+        MASK_SIZE(mAppendStringPattern)
+    );
 
     if (NULL == lpAppendStringPatternAddy) {
         fprintf(
@@ -547,55 +489,71 @@ int main(int argc, const char *argv[]) {
         Offsets.AppendString
     );
 
-    LPCBYTE lpProcessEventXRefPatternAddy =
-        SigScan(
-            lpMemoryMappedFile,
-            nFileSize,
-            abProcessEventXRefPattern,
-            sizeof(abProcessEventXRefPattern)
-        );
+    LPCBYTE lpGNamesPatternAddy = (LPCBYTE) ((QWORD64) lpAppendStringPatternAddy + 0x20U);
 
-    if (NULL == lpProcessEventXRefPatternAddy) {
+    printf(
+        " ** Assuming GNames pattern is at offset: 0x%llX (0x%llX)\n",
+        (DWORD64) (lpGNamesPatternAddy - lpMemoryMappedFile),
+        (DWORD64) (lpGNamesPatternAddy - lpMemoryMappedFile) + dwTextRVA
+    );
+
+    Offsets.GNames = EvaluatePatternOffset(
+        "GNames",
+        dwTextRVA,
+        lpGNamesPatternAddy,
+        lpMemoryMappedFile,
+        3
+    );
+
+    LPCBYTE lpProcessEventFileOffset = SearchForMaskedSignature(
+        lpMemoryMappedFile,
+        nFileSize,
+        mProcessEventPattern,
+        MASK_SIZE(mProcessEventPattern)
+    );
+
+    if (NULL == lpProcessEventFileOffset) {
         fprintf(
             stderr,
-            "[-] Failed to find ProcessEvent xref pattern in file.\n"
+            "[-] Failed to find ProcessEvent pattern in file.\n"
         );
         goto _RYUJI;
     }
 
-    // Relative call offset is taken from the CALL instruction (last E8 byte), 
-    // The displacement operand starts right after the pattern ends
-    // (at sizeof(abProcessEventXRefPattern)), so EvaluatePatternOffset can compute the absolute
-    // address of the ProcessEvent function the same way it does for GWorld/GNames/GObjects.
-    /*
-        .text:000000014386DFD2 75 0E                                                        jnz     short loc_14386DFE2
-        .text:000000014386DFD4 4C 8B C5                                                     mov     r8, rbp
-        .text:000000014386DFD7 48 8B D3                                                     mov     rdx, rbx
-        .text:000000014386DFDA 48 8B CF                                                     mov     rcx, rdi
-        .text:000000014386DFDD E8 BE 73 D3 FD                                               call    sub_1415A53A0
-    */
-    Offsets.ProcessEvent =
-        EvaluatePatternOffset(
-            "ProcessEvent",
-            dwTextRVA,
-            lpProcessEventXRefPatternAddy,
-            lpMemoryMappedFile,
-            (DWORD) sizeof(abProcessEventXRefPattern)
+    Offsets.ProcessEvent = (DWORD64) (lpProcessEventFileOffset - lpMemoryMappedFile) + dwTextRVA;
+
+    LPCBYTE lpFindFunctionCheckedFileOffset = SearchForMaskedSignature(
+        lpMemoryMappedFile,
+        nFileSize,
+        mFindFunctionCheckedPattern,
+        MASK_SIZE(mFindFunctionCheckedPattern)
+    );
+
+    if (NULL == lpFindFunctionCheckedFileOffset) {
+        fprintf(
+            stderr,
+            "[-] Failed to find FindFunctionChecked pattern in file.\n"
         );
+        goto _RYUJI;
+    }
+
+    Offsets.FindFunctionChecked = (DWORD64) (lpFindFunctionCheckedFileOffset - lpMemoryMappedFile) + dwTextRVA;
 
     printf(
         "\n"
-        " :: GObjects       : 0x%08llX\n"
-        " :: AppendString   : 0x%08llX\n"
-        " :: GNames         : 0x%08llX\n"
-        " :: GWorld         : 0x%08llX\n"
-        " :: ProcessEvent   : 0x%08llX\n"
+        " :: GObjects            : 0x%08llX\n"
+        " :: AppendString        : 0x%08llX\n"
+        " :: GNames              : 0x%08llX\n"
+        " :: GWorld              : 0x%08llX\n"
+        " :: ProcessEvent        : 0x%08llX\n"
+        " :: FindFunctionChecked : 0x%08llX\n"
         "\n",
         Offsets.GObjects,
         Offsets.AppendString,
         Offsets.GNames,
         Offsets.GWorld,
-        Offsets.ProcessEvent
+        Offsets.ProcessEvent,
+        Offsets.FindFunctionChecked
     );
 
     if (

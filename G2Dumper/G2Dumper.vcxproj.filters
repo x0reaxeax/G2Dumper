@@ -13,10 +13,24 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
+    <Filter Include="Header Files\H2SS">
+      <UniqueIdentifier>{c02cd37e-4ee5-4430-ac35-a81172091a69}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\H2SS">
+      <UniqueIdentifier>{0d917936-2fc8-4c91-8477-d02892cd4489}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="H2SS\SigScan64.c">
+      <Filter>Source Files\H2SS</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="H2SS\SigScan64.h">
+      <Filter>Header Files\H2SS</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>
